@@ -1,0 +1,237 @@
+// Package api provides the REST API server for dashboard integration.
+package api
+
+import (
+	"context"
+	"fmt"
+	"net/http"
+	"strings"
+	"time"
+
+	"github.com/labstack/echo/v4"
+	"github.com/labstack/echo/v4/middleware"
+	"github.com/sirupsen/logrus"
+
+	"github.com/edr-platform/connection-manager/config"
+	"github.com/edr-platform/connection-manager/pkg/metrics"
+)
+
+// Server represents the REST API server.
+type Server struct {
+	echo    *echo.Echo
+	config  *config.APIConfig
+	logger  *logrus.Logger
+	metrics *metrics.Metrics
+}
+
+// NewServer creates a new REST API server.
+func NewServer(cfg *config.APIConfig, logger *logrus.Logger, m *metrics.Metrics) *Server {
+	e := echo.New()
+	e.HideBanner = true
+	e.HidePort = true
+
+	// Configure middleware stack
+	e.Use(middleware.RequestIDWithConfig(middleware.RequestIDConfig{
+		Generator: func() string {
+			return fmt.Sprintf("req-%d", time.Now().UnixNano())
+		},
+	}))
+
+	e.Use(middleware.LoggerWithConfig(middleware.LoggerConfig{
+		Format: `{"time":"${time_rfc3339}","id":"${id}","method":"${method}","uri":"${uri}","status":${status},"latency":"${latency_human}","bytes_out":${bytes_out}}` + "\n",
+	}))
+
+	e.Use(middleware.Recover())
+
+	// CORS configuration
+	e.Use(middleware.CORSWithConfig(middleware.CORSConfig{
+		AllowOrigins:     cfg.CORSAllowOrigins,
+		AllowMethods:     cfg.CORSAllowMethods,
+		AllowHeaders:     []string{echo.HeaderOrigin, echo.HeaderContentType, echo.HeaderAccept, echo.HeaderAuthorization},
+		AllowCredentials: true,
+		MaxAge:           3600,
+	}))
+
+	// Request timeout (skip for long-running endpoints like agent build)
+	e.Use(middleware.TimeoutWithConfig(middleware.TimeoutConfig{
+		Skipper: func(c echo.Context) bool {
+			p := c.Request().URL.Path
+			return strings.HasSuffix(p, "/agent/build")
+		},
+		Timeout: cfg.RequestTimeout,
+	}))
+
+	// Body limit
+	e.Use(middleware.BodyLimit(fmt.Sprintf("%dM", cfg.MaxRequestBodySize/(1024*1024))))
+
+	// Gzip compression
+	e.Use(middleware.GzipWithConfig(middleware.GzipConfig{
+		Level: 5,
+	}))
+
+	return &Server{
+		echo:    e,
+		config:  cfg,
+		logger:  logger,
+		metrics: m,
+	}
+}
+
+// RegisterRoutes registers all API routes.
+//
+// RBAC enforcement: every route has a RequirePermission middleware that checks
+// the user's role against the permissions table. This prevents unauthorized
+// access even if the dashboard UI hides certain elements — the backend is the
+// single source of truth for access control.
+func (s *Server) RegisterRoutes(handlers *Handlers) {
+	// Health check (no auth)
+	s.echo.GET("/healthz", s.healthCheck)
+	s.echo.GET("/readyz", s.readyCheck)
+
+	// API v1 group
+	v1 := s.echo.Group("/api/v1")
+
+	// Zero-touch provisioning: public CA cert endpoint (no auth required)
+	v1.GET("/agent/ca", handlers.ServeCA)
+
+	// Auth endpoints (no auth required for login)
+	auth := v1.Group("/auth")
+	auth.POST("/login", handlers.Login)
+	auth.POST("/refresh", handlers.RefreshToken)
+	auth.POST("/logout", handlers.Logout, handlers.AuthMiddleware)
+	auth.GET("/me", handlers.GetCurrentUser, handlers.AuthMiddleware)
+
+	// Protected endpoints — all require valid JWT
+	protected := v1.Group("")
+	protected.Use(handlers.AuthMiddleware)
+
+	// ── Agent/Endpoint endpoints ─────────────────────────────────────────
+	// Read: endpoints:read | Modify: endpoints:manage | Isolate: endpoints:isolate
+	agents := protected.Group("/agents")
+	agents.GET("", handlers.ListAgents, handlers.RequirePermission("endpoints", "read"))
+	agents.GET("/stats", handlers.GetAgentStats, handlers.RequirePermission("endpoints", "read"))
+	agents.GET("/:id", handlers.GetAgent, handlers.RequirePermission("endpoints", "read"))
+	agents.PATCH("/:id", handlers.UpdateAgent, handlers.RequirePermission("endpoints", "manage"))
+	agents.DELETE("/:id", handlers.DeleteAgent, handlers.RequirePermission("endpoints", "manage"))
+	agents.GET("/:id/events", handlers.GetAgentEvents, handlers.RequirePermission("endpoints", "read"))
+	agents.GET("/:id/commands", handlers.GetAgentCommands, handlers.RequirePermission("responses", "read"))
+	agents.POST("/:id/commands", handlers.ExecuteAgentCommand, handlers.RequirePermission("responses", "execute"))
+	// Backward-compat alias: some clients may omit the trailing 's'
+	agents.POST("/:id/command", handlers.ExecuteAgentCommand, handlers.RequirePermission("responses", "execute"))
+
+	// ── Command history endpoints (Action Center) ────────────────────────
+	commands := protected.Group("/commands")
+	commands.GET("", handlers.ListCommands, handlers.RequirePermission("responses", "read"))
+	commands.GET("/stats", handlers.GetCommandStats, handlers.RequirePermission("responses", "read"))
+
+	// ── Alert endpoints ──────────────────────────────────────────────────
+	alerts := protected.Group("/alerts")
+	alerts.GET("", handlers.ListAlerts, handlers.RequirePermission("alerts", "read"))
+	alerts.POST("/search", handlers.SearchAlerts, handlers.RequirePermission("alerts", "read"))
+	alerts.GET("/stats", handlers.GetAlertStats, handlers.RequirePermission("alerts", "read"))
+	alerts.GET("/endpoint-risk", handlers.GetEndpointRisk, handlers.RequirePermission("alerts", "read"))
+	alerts.GET("/:id", handlers.GetAlert, handlers.RequirePermission("alerts", "read"))
+	alerts.PATCH("/:id", handlers.UpdateAlert, handlers.RequirePermission("alerts", "write"))
+	alerts.POST("/:id/resolve", handlers.ResolveAlert, handlers.RequirePermission("alerts", "write"))
+	alerts.POST("/:id/notes", handlers.AddAlertNote, handlers.RequirePermission("alerts", "write"))
+	alerts.DELETE("/:id", handlers.DeleteAlert, handlers.RequirePermission("alerts", "delete"))
+
+	// ── Event endpoints ──────────────────────────────────────────────────
+	// Events are part of the alert investigation workflow → alerts:read
+	events := protected.Group("/events")
+	events.POST("/search", handlers.SearchEvents, handlers.RequirePermission("alerts", "read"))
+	events.GET("/stats", handlers.GetEventStats, handlers.RequirePermission("alerts", "read"))
+	events.GET("/:id", handlers.GetEvent, handlers.RequirePermission("alerts", "read"))
+	events.POST("/export", handlers.ExportEvents, handlers.RequirePermission("alerts", "read"))
+
+	// ── Reliability health (operational) ──────────────────────────────────
+	// Authenticated endpoint (no extra RBAC gate) to avoid false-negative
+	// "backend unreachable" UI states when role permission catalogs drift.
+	protected.GET("/reliability", handlers.GetReliabilityHealth)
+
+	// ── Context-aware policy controls ──────────────────────────────────────
+	contextPolicies := protected.Group("/context-policies")
+	contextPolicies.GET("", handlers.ListContextPolicies, handlers.RequirePermission("settings", "read"))
+	contextPolicies.POST("", handlers.CreateContextPolicy, handlers.RequirePermission("settings", "write"))
+	contextPolicies.GET("/:id", handlers.GetContextPolicy, handlers.RequirePermission("settings", "read"))
+	contextPolicies.PATCH("/:id", handlers.UpdateContextPolicy, handlers.RequirePermission("settings", "write"))
+	contextPolicies.DELETE("/:id", handlers.DeleteContextPolicy, handlers.RequirePermission("settings", "write"))
+
+	// ── Policy endpoints ─────────────────────────────────────────────────
+	policies := protected.Group("/policies")
+	policies.GET("", handlers.ListPolicies, handlers.RequirePermission("settings", "read"))
+	policies.POST("", handlers.CreatePolicy, handlers.RequirePermission("settings", "write"))
+	policies.GET("/:id", handlers.GetPolicy, handlers.RequirePermission("settings", "read"))
+	policies.PATCH("/:id", handlers.UpdatePolicy, handlers.RequirePermission("settings", "write"))
+	policies.DELETE("/:id", handlers.DeletePolicy, handlers.RequirePermission("settings", "write"))
+	policies.GET("/:id/agents", handlers.GetPolicyAgents, handlers.RequirePermission("settings", "read"))
+
+	// ── User endpoints ───────────────────────────────────────────────────
+	users := protected.Group("/users")
+	users.GET("", handlers.ListUsers, handlers.RequirePermission("users", "read"))
+	users.POST("", handlers.CreateUser, handlers.RequirePermission("users", "write"))
+	users.GET("/:id", handlers.GetUser, handlers.RequirePermission("users", "read"))
+	users.PATCH("/:id", handlers.UpdateUser, handlers.RequirePermission("users", "write"))
+	users.DELETE("/:id", handlers.DeleteUser, handlers.RequirePermission("users", "delete"))
+	// Password change: in-handler authorization (self or admin) — no middleware
+	users.POST("/:id/password", handlers.ChangePassword)
+
+	// ── Role & Permission endpoints ──────────────────────────────────────
+	roles := protected.Group("/roles")
+	roles.GET("", handlers.ListRoles, handlers.RequirePermission("roles", "read"))
+	roles.POST("", handlers.CreateRole, handlers.RequirePermission("roles", "write"))
+	roles.PATCH("/:id/permissions", handlers.UpdateRolePermissions, handlers.RequirePermission("roles", "write"))
+	roles.DELETE("/:id", handlers.DeleteRole, handlers.RequirePermission("roles", "write"))
+
+	// Permissions listing (read access for roles:read holders)
+	protected.GET("/permissions", handlers.ListPermissions, handlers.RequirePermission("roles", "read"))
+
+	// ── Audit endpoints ──────────────────────────────────────────────────
+	audit := protected.Group("/audit")
+	audit.GET("/logs", handlers.ListAuditLogs, handlers.RequirePermission("audit", "read"))
+	audit.GET("/logs/:id", handlers.GetAuditLog, handlers.RequirePermission("audit", "read"))
+
+	// ── Enrollment token management ──────────────────────────────────────
+	tokens := protected.Group("/enrollment-tokens")
+	tokens.GET("", handlers.ListEnrollmentTokens, handlers.RequirePermission("tokens", "read"))
+	tokens.POST("", handlers.GenerateEnrollmentToken, handlers.RequirePermission("tokens", "write"))
+	tokens.POST("/:id/revoke", handlers.RevokeEnrollmentToken, handlers.RequirePermission("tokens", "write"))
+
+	// ── Agent build (deployment) ─────────────────────────────────────────
+	protected.POST("/agent/build", handlers.BuildAgent, handlers.RequirePermission("agents", "write"))
+}
+
+// healthCheck returns server health status.
+func (s *Server) healthCheck(c echo.Context) error {
+	return c.JSON(http.StatusOK, map[string]interface{}{
+		"status":    "healthy",
+		"timestamp": time.Now().UTC().Format(time.RFC3339),
+	})
+}
+
+// readyCheck returns server readiness status.
+func (s *Server) readyCheck(c echo.Context) error {
+	// TODO: Check database, Redis, Kafka connectivity
+	return c.JSON(http.StatusOK, map[string]interface{}{
+		"status":    "ready",
+		"timestamp": time.Now().UTC().Format(time.RFC3339),
+	})
+}
+
+// Start starts the API server.
+func (s *Server) Start() error {
+	addr := fmt.Sprintf(":%d", s.config.Port)
+	s.logger.WithField("addr", addr).Info("Starting REST API server")
+	return s.echo.Start(addr)
+}
+
+// Shutdown gracefully shuts down the server.
+func (s *Server) Shutdown(ctx context.Context) error {
+	s.logger.Info("Shutting down REST API server...")
+	return s.echo.Shutdown(ctx)
+}
+
+// Echo returns the underlying Echo instance.
+func (s *Server) Echo() *echo.Echo {
+	return s.echo
+}
